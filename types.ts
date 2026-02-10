@@ -18,6 +18,13 @@ export interface Week {
   competitions: Competition[];
 }
 
+export interface Track {
+  id: string;
+  title: string;
+  description: string;
+  weeks: Week[];
+}
+
 export interface TicketSection {
   title: string;
   items: string[];

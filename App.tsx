@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { WEEKS } from './constants';
+import { TRACKS } from './constants';
 import WeekView from './components/WeekView';
 import TheoryView from './components/TheoryView';
 
@@ -7,8 +7,51 @@ type ViewMode = 'competitions' | 'theory';
 
 const App: React.FC = () => {
   const [viewMode, setViewMode] = useState<ViewMode>('competitions');
+  const [activeTrackId, setActiveTrackId] = useState<string>(TRACKS[0].id);
   const [activeWeekId, setActiveWeekId] = useState<number>(1);
-  const activeWeek = WEEKS.find(w => w.id === activeWeekId) || WEEKS[0];
+
+  const activeTrack = TRACKS.find(t => t.id === activeTrackId) || TRACKS[0];
+  const activeWeek = activeTrack.weeks.find(w => w.id === activeWeekId) || activeTrack.weeks[0];
+
+  const handleTrackChange = (trackId: string) => {
+    setActiveTrackId(trackId);
+    setActiveWeekId(1); // Reset to week 1 when switching tracks
+  };
+
+  const getTrackStyles = (trackId: string, isActive: boolean) => {
+    switch (trackId) {
+      case 'audio':
+        return {
+          accentColor: 'text-pink-400',
+          indicatorClass: isActive ? 'bg-pink-400 shadow-[0_0_8px_rgba(244,114,182,0.8)]' : 'bg-slate-600',
+          containerClass: isActive ? 'bg-slate-800 text-white shadow-lg ring-1 ring-pink-500/30' : 'hover:bg-slate-800/50 text-slate-400 hover:text-slate-200'
+        };
+      case 'detection':
+        return {
+          accentColor: 'text-green-400',
+          indicatorClass: isActive ? 'bg-green-400 shadow-[0_0_8px_rgba(74,222,128,0.8)]' : 'bg-slate-600',
+          containerClass: isActive ? 'bg-slate-800 text-white shadow-lg ring-1 ring-green-500/30' : 'hover:bg-slate-800/50 text-slate-400 hover:text-slate-200'
+        };
+      case 'segmentation':
+        return {
+          accentColor: 'text-purple-400',
+          indicatorClass: isActive ? 'bg-purple-400 shadow-[0_0_8px_rgba(192,132,252,0.8)]' : 'bg-slate-600',
+          containerClass: isActive ? 'bg-slate-800 text-white shadow-lg ring-1 ring-purple-500/30' : 'hover:bg-slate-800/50 text-slate-400 hover:text-slate-200'
+        };
+      case 'tabular':
+        return {
+          accentColor: 'text-orange-400',
+          indicatorClass: isActive ? 'bg-orange-400 shadow-[0_0_8px_rgba(251,146,60,0.8)]' : 'bg-slate-600',
+          containerClass: isActive ? 'bg-slate-800 text-white shadow-lg ring-1 ring-orange-500/30' : 'hover:bg-slate-800/50 text-slate-400 hover:text-slate-200'
+        };
+      default: // image
+        return {
+          accentColor: 'text-cyan-400',
+          indicatorClass: isActive ? 'bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.8)]' : 'bg-slate-600',
+          containerClass: isActive ? 'bg-slate-800 text-white shadow-lg ring-1 ring-cyan-500/30' : 'hover:bg-slate-800/50 text-slate-400 hover:text-slate-200'
+        };
+    }
+  };
 
   return (
     <div className="min-h-screen bg-[#030712] text-slate-200 selection:bg-cyan-500/30 selection:text-cyan-200 overflow-x-hidden">
@@ -40,7 +83,7 @@ const App: React.FC = () => {
           </h1>
 
           {/* Cyberpunk Toggle Switch */}
-          <div className="relative p-1 bg-slate-900/50 border border-slate-800 rounded-lg backdrop-blur-md inline-flex">
+          <div className="relative p-1 bg-slate-900/50 border border-slate-800 rounded-lg backdrop-blur-md inline-flex mb-8">
             <div 
               className={`absolute top-1 bottom-1 w-[calc(50%-4px)] bg-slate-800 border border-slate-700 rounded transition-all duration-300 ease-out shadow-lg ${
                 viewMode === 'competitions' ? 'left-1' : 'left-[calc(50%+0px)] translate-x-0'
@@ -69,9 +112,35 @@ const App: React.FC = () => {
         <div className="min-h-[600px] animate-fade-in-up">
           {viewMode === 'competitions' ? (
             <>
+              {/* Track Selector */}
+              <div className="flex justify-center mb-10">
+                 <div className="inline-flex flex-wrap justify-center gap-4 p-2 bg-[#0a0f1c]/50 border border-slate-800 rounded-2xl backdrop-blur-xl max-w-4xl">
+                   {TRACKS.map((track, index) => {
+                      const isActive = activeTrackId === track.id;
+                      const styles = getTrackStyles(track.id, isActive);
+
+                      return (
+                        <button
+                          key={track.id}
+                          onClick={() => handleTrackChange(track.id)}
+                          className={`relative px-6 py-3 rounded-xl transition-all duration-300 flex items-center gap-3 overflow-hidden ${styles.containerClass}`}
+                        >
+                           {/* Status Indicator */}
+                           <div className={`w-2 h-2 rounded-full ${styles.indicatorClass}`}></div>
+                           
+                           <div className="text-left">
+                             <div className="text-xs font-mono uppercase tracking-wider opacity-70">Module_0{index + 1}</div>
+                             <div className={`font-bold whitespace-nowrap ${isActive ? styles.accentColor : ''}`}>{track.title}</div>
+                           </div>
+                        </button>
+                      )
+                   })}
+                 </div>
+              </div>
+
               {/* Week Navigation */}
               <div className="flex flex-wrap justify-center gap-4 mb-12">
-                {WEEKS.map((week) => {
+                {activeTrack.weeks.map((week) => {
                   const isActive = activeWeekId === week.id;
                   return (
                     <button
@@ -115,7 +184,7 @@ const App: React.FC = () => {
           <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
           <span className="text-xs font-mono text-slate-400">
             {viewMode === 'competitions' 
-              ? "STATUS: TRAINING IN PROGRESS"
+              ? `STATUS: TRAINING [${activeTrack.title.toUpperCase()}]`
               : "STATUS: ACQUIRING KNOWLEDGE"}
           </span>
         </div>
