@@ -1,3 +1,4 @@
+
 export interface Task {
   title: string;
   description: string;
@@ -18,11 +19,19 @@ export interface Week {
   competitions: Competition[];
 }
 
+export interface CodeSnippet {
+  title: string;
+  description: string;
+  code: string;
+  category: string;
+}
+
 export interface Track {
   id: string;
   title: string;
   description: string;
   weeks: Week[];
+  snippets?: CodeSnippet[];
 }
 
 export interface TicketSection {

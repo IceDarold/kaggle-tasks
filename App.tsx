@@ -2,20 +2,25 @@ import React, { useState } from 'react';
 import { TRACKS } from './constants';
 import WeekView from './components/WeekView';
 import TheoryView from './components/TheoryView';
+import SnippetsView from './components/SnippetsView';
 
 type ViewMode = 'competitions' | 'theory';
+type SubViewMode = 'schedule' | 'code';
 
 const App: React.FC = () => {
   const [viewMode, setViewMode] = useState<ViewMode>('competitions');
+  const [subViewMode, setSubViewMode] = useState<SubViewMode>('schedule');
   const [activeTrackId, setActiveTrackId] = useState<string>(TRACKS[0].id);
   const [activeWeekId, setActiveWeekId] = useState<number>(1);
 
   const activeTrack = TRACKS.find(t => t.id === activeTrackId) || TRACKS[0];
   const activeWeek = activeTrack.weeks.find(w => w.id === activeWeekId) || activeTrack.weeks[0];
+  const hasSnippets = activeTrack.snippets && activeTrack.snippets.length > 0;
 
   const handleTrackChange = (trackId: string) => {
     setActiveTrackId(trackId);
     setActiveWeekId(1); // Reset to week 1 when switching tracks
+    setSubViewMode('schedule'); // Reset to schedule view
   };
 
   const getTrackStyles = (trackId: string, isActive: boolean) => {
@@ -69,7 +74,7 @@ const App: React.FC = () => {
       <main className="relative z-10 container mx-auto px-4 py-8 max-w-7xl">
         
         {/* Header Section */}
-        <header className="flex flex-col items-center justify-center mb-16 pt-8">
+        <header className="flex flex-col items-center justify-center mb-12 pt-8">
           <div className="flex items-center gap-2 mb-4">
             <div className="h-1 w-1 bg-cyan-500 rounded-full animate-ping"></div>
             <span className="text-xs font-mono text-cyan-500 tracking-[0.2em] uppercase">System Online</span>
@@ -113,7 +118,7 @@ const App: React.FC = () => {
           {viewMode === 'competitions' ? (
             <>
               {/* Track Selector */}
-              <div className="flex justify-center mb-10">
+              <div className="flex justify-center mb-8">
                  <div className="inline-flex flex-wrap justify-center gap-4 p-2 bg-[#0a0f1c]/50 border border-slate-800 rounded-2xl backdrop-blur-xl max-w-4xl">
                    {TRACKS.map((track, index) => {
                       const isActive = activeTrackId === track.id;
@@ -138,38 +143,73 @@ const App: React.FC = () => {
                  </div>
               </div>
 
-              {/* Week Navigation */}
-              <div className="flex flex-wrap justify-center gap-4 mb-12">
-                {activeTrack.weeks.map((week) => {
-                  const isActive = activeWeekId === week.id;
-                  return (
-                    <button
-                      key={week.id}
-                      onClick={() => setActiveWeekId(week.id)}
-                      className={`group relative px-6 py-4 rounded-xl border transition-all duration-300 overflow-hidden ${
-                        isActive 
-                          ? 'bg-slate-900/80 border-cyan-500/50 shadow-[0_0_30px_-10px_rgba(34,211,238,0.3)]' 
-                          : 'bg-slate-900/30 border-slate-800 hover:border-slate-600 hover:bg-slate-800/50'
+              {/* Sub-View Toggle (Schedule / Code) - Only if snippets exist */}
+              {hasSnippets && (
+                <div className="flex justify-center mb-10">
+                  <div className="flex bg-slate-900/50 rounded-lg p-1 border border-slate-800">
+                    <button 
+                      onClick={() => setSubViewMode('schedule')}
+                      className={`px-6 py-2 rounded text-xs font-bold uppercase tracking-wider transition-all ${
+                        subViewMode === 'schedule' 
+                        ? 'bg-slate-700 text-white shadow-md' 
+                        : 'text-slate-500 hover:text-slate-300'
                       }`}
                     >
-                      {isActive && <div className="absolute inset-0 bg-cyan-500/5 pointer-events-none"></div>}
-                      <div className="flex flex-col items-center">
-                        <span className={`text-xs font-mono uppercase tracking-widest mb-1 ${isActive ? 'text-cyan-400' : 'text-slate-500'}`}>
-                          Week 0{week.id}
-                        </span>
-                        <span className={`text-sm font-bold ${isActive ? 'text-white' : 'text-slate-400'}`}>
-                          {week.title}
-                        </span>
-                        <span className={`text-[10px] mt-1 ${isActive ? 'text-cyan-300/70' : 'text-slate-600'}`}>
-                          {week.subtitle.split('—')[0]}
-                        </span>
-                      </div>
+                      Schedule
                     </button>
-                  );
-                })}
-              </div>
-              
-              <WeekView week={activeWeek} />
+                    <button 
+                      onClick={() => setSubViewMode('code')}
+                      className={`px-6 py-2 rounded text-xs font-bold uppercase tracking-wider transition-all ${
+                         subViewMode === 'code' 
+                         ? 'bg-cyan-900/50 text-cyan-300 border border-cyan-700/50 shadow-md' 
+                         : 'text-slate-500 hover:text-slate-300'
+                      }`}
+                    >
+                      Code Patterns
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* View Render */}
+              {subViewMode === 'schedule' ? (
+                <>
+                  {/* Week Navigation */}
+                  <div className="flex flex-wrap justify-center gap-4 mb-12">
+                    {activeTrack.weeks.map((week) => {
+                      const isActive = activeWeekId === week.id;
+                      return (
+                        <button
+                          key={week.id}
+                          onClick={() => setActiveWeekId(week.id)}
+                          className={`group relative px-6 py-4 rounded-xl border transition-all duration-300 overflow-hidden ${
+                            isActive 
+                              ? 'bg-slate-900/80 border-cyan-500/50 shadow-[0_0_30px_-10px_rgba(34,211,238,0.3)]' 
+                              : 'bg-slate-900/30 border-slate-800 hover:border-slate-600 hover:bg-slate-800/50'
+                          }`}
+                        >
+                          {isActive && <div className="absolute inset-0 bg-cyan-500/5 pointer-events-none"></div>}
+                          <div className="flex flex-col items-center">
+                            <span className={`text-xs font-mono uppercase tracking-widest mb-1 ${isActive ? 'text-cyan-400' : 'text-slate-500'}`}>
+                              Week 0{week.id}
+                            </span>
+                            <span className={`text-sm font-bold ${isActive ? 'text-white' : 'text-slate-400'}`}>
+                              {week.title}
+                            </span>
+                            <span className={`text-[10px] mt-1 ${isActive ? 'text-cyan-300/70' : 'text-slate-600'}`}>
+                              {week.subtitle.split('—')[0]}
+                            </span>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  
+                  <WeekView week={activeWeek} />
+                </>
+              ) : (
+                <SnippetsView snippets={activeTrack.snippets || []} />
+              )}
             </>
           ) : (
             <TheoryView />

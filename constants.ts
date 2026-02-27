@@ -1,4 +1,364 @@
-import { Week, Ticket, Track } from './types';
+import { Week, Ticket, Track, CodeSnippet } from './types';
+
+const IMAGE_SNIPPETS: CodeSnippet[] = [
+  // --- SECTION 1: BASELINE (Essential for first sub) ---
+  {
+    title: "01. [Baseline] Seed Everything",
+    category: "Baseline",
+    description: "The absolute first step. Ensures your experiments are reproducible and deterministic.",
+    code: `import os
+import random
+import numpy as np
+import torch
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False # True for speed, False for exact repro
+
+seed_everything(42)`
+  },
+  {
+    title: "02. [Baseline] Stratified K-Fold CV",
+    category: "Baseline",
+    description: "The gold standard for validation. Ensures class distribution is preserved across folds. Do this BEFORE creating datasets.",
+    code: `from sklearn.model_selection import StratifiedKFold
+
+# 1. Create Folds
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+df['fold'] = -1
+for fold, (train_idx, val_idx) in enumerate(skf.split(df, df['target'])):
+    df.loc[val_idx, 'fold'] = fold
+
+# 2. Usage in Loop
+for fold in range(5):
+    train_df = df[df['fold'] != fold].reset_index(drop=True)
+    valid_df = df[df['fold'] == fold].reset_index(drop=True)
+    # ... init loaders and train ...`
+  },
+  {
+    title: "03. [Baseline] Custom Dataset Class",
+    category: "Baseline",
+    description: "Standard PyTorch Dataset template. Handles image loading (OpenCV) and applying transforms.",
+    code: `import cv2
+import torch
+from torch.utils.data import Dataset
+
+class CustomDataset(Dataset):
+    def __init__(self, df, transforms=None, mode='train'):
+        self.df = df
+        self.transforms = transforms
+        self.mode = mode
+        # Pre-load file paths to avoid overhead
+        self.file_names = df['file_path'].values
+        # Only load targets if training/validating
+        self.labels = df['target'].values if mode != 'test' else None
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, index):
+        # 1. Load Image
+        image_path = self.file_names[index]
+        image = cv2.imread(image_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        # 2. Apply Augmentations
+        if self.transforms:
+            augmented = self.transforms(image=image)
+            image = augmented['image']
+
+        # 3. Return (Image, Label) or (Image,)
+        if self.mode != 'test':
+            label = torch.tensor(self.labels[index], dtype=torch.long)
+            return image, label
+        else:
+            return image`
+  },
+  {
+    title: "04. [Baseline] DataLoader Setup",
+    category: "Baseline",
+    description: "Optimized data loading. Critical params: num_workers, pin_memory, and drop_last for training.",
+    code: `from torch.utils.data import DataLoader
+
+# Constants
+BATCH_SIZE = 32
+IMG_SIZE = 384
+NUM_WORKERS = 4 # Usually count of CPU cores
+
+# Init Datasets
+train_dataset = CustomDataset(train_df, transforms=get_train_transforms(IMG_SIZE), mode='train')
+valid_dataset = CustomDataset(valid_df, transforms=get_valid_transforms(IMG_SIZE), mode='valid')
+
+# Init Loaders
+train_loader = DataLoader(
+    train_dataset, 
+    batch_size=BATCH_SIZE, 
+    shuffle=True, 
+    num_workers=NUM_WORKERS, 
+    pin_memory=True, # Faster data transfer to GPU
+    drop_last=True   # Good for BN statistics
+)
+
+valid_loader = DataLoader(
+    valid_dataset, 
+    batch_size=BATCH_SIZE, 
+    shuffle=False, 
+    num_workers=NUM_WORKERS, 
+    pin_memory=True
+)`
+  },
+  {
+    title: "05. [Baseline] Model Init (timm)",
+    category: "Baseline",
+    description: "Using 'timm' is the industry standard. Quickly swap backbones (EfficientNet, ConvNeXt, ResNet).",
+    code: `import timm
+import torch.nn as nn
+
+class CloudModel(nn.Module):
+    def __init__(self, model_name='tf_efficientnet_b0_ns', pretrained=True, num_classes=5):
+        super().__init__()
+        # Load backbone
+        self.model = timm.create_model(model_name, pretrained=pretrained)
+        
+        # Replace classifier head
+        # 'classifier' name varies: 'fc' (ResNet), 'head' (ViT), 'classifier' (EffNet)
+        in_features = self.model.classifier.in_features
+        self.model.classifier = nn.Sequential(
+            nn.Dropout(p=0.2),
+            nn.Linear(in_features, num_classes)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+# Usage
+model = CloudModel(model_name='convnext_tiny', num_classes=10)
+model = model.cuda()`
+  },
+
+  // --- SECTION 2: OPTIMIZATION (Speed & Convergence) ---
+  {
+    title: "06. [Optimization] AMP (Mixed Precision)",
+    category: "Optimization",
+    description: "Drastically reduces VRAM usage and speeds up training. Standard in modern PyTorch.",
+    code: `from torch.cuda.amp import autocast, GradScaler
+
+scaler = GradScaler()
+
+# Training Loop
+for images, labels in train_loader:
+    optimizer.zero_grad()
+    
+    with autocast():
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+    
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()`
+  },
+  {
+    title: "07. [Optimization] Learning Rate Schedulers",
+    category: "Optimization",
+    description: "Choosing the right scheduler is critical. Here are the Top-3 industry standards for different scenarios.",
+    code: `from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, OneCycleLR, ReduceLROnPlateau
+
+# Option 1: Cosine Annealing with Warm Restarts (The "Default" Winner)
+# Use when: You want stable convergence and are training for many epochs.
+# Helps escape local minima by "restarting" the LR.
+scheduler = CosineAnnealingWarmRestarts(
+    optimizer, 
+    T_0=10,      # First restart after 10 epochs
+    T_mult=2,    # Double the cycle length after restart (10 -> 20 -> 40...)
+    eta_min=1e-6 # Minimum LR
+)
+# Call: scheduler.step() (usually per epoch)
+
+
+# Option 2: One Cycle Policy (Super-Convergence)
+# Use when: You have a fixed budget (e.g., 5-10 epochs) and need maximum speed.
+# Starts low, goes high, ends very low.
+scheduler = OneCycleLR(
+    optimizer,
+    max_lr=1e-3,
+    steps_per_epoch=len(train_loader),
+    epochs=EPOCHS,
+    pct_start=0.3, # 30% of time warming up
+    div_factor=25  # init_lr = max_lr / 25
+)
+# Call: scheduler.step() (MUST be called per batch)
+
+
+# Option 3: Reduce LR On Plateau (Old reliable)
+# Use when: Fine-tuning or when training length is unknown.
+# Drops LR when validation metric stops improving.
+scheduler = ReduceLROnPlateau(
+    optimizer,
+    mode='min',  # 'min' for loss, 'max' for accuracy/metric
+    factor=0.1,  # new_lr = lr * 0.1
+    patience=5,  # Wait 5 epochs with no improvement
+    verbose=True
+)
+# Call: scheduler.step(val_loss) (per epoch, requires metric)`
+  },
+
+  // --- SECTION 3: AUGMENTATION & REGULARIZATION ---
+  {
+    title: "08. [Augmentation] Albumentations",
+    category: "Augmentation",
+    description: "Competitive pipeline. Key: CoarseDropout (Cutout), ShiftScaleRotate, and Color Jitter.",
+    code: `import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+def get_train_transforms(size):
+    return A.Compose([
+        A.Resize(size, size),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.ShiftScaleRotate(shift_limit=0.0625, scale_limit=0.2, rotate_limit=45, p=0.5),
+        
+        # Color & Noise
+        A.OneOf([
+            A.HueSaturationValue(hue_shift_limit=0.2, sat_shift_limit=0.2, val_shift_limit=0.2, p=0.9),
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.9),
+        ], p=0.5),
+        
+        # Regularization (Cutout)
+        A.CoarseDropout(max_holes=8, max_height=int(size*0.1), max_width=int(size*0.1), p=0.5),
+        
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ])`
+  },
+  {
+    title: "09. [Regularization] MixUp & CutMix",
+    category: "Augmentation",
+    description: "SOTA regularization. Mixes images and labels to enforce linearity. Use inside train loop.",
+    code: `import numpy as np
+import torch
+
+def mixup_data(x, y, alpha=1.0, use_cuda=True):
+    '''Returns mixed inputs, pairs of targets, and lambda'''
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = x.size()[0]
+    if use_cuda:
+        index = torch.randperm(batch_size).cuda()
+    else:
+        index = torch.randperm(batch_size)
+
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+# Usage inside train loop:
+# inputs, targets_a, targets_b, lam = mixup_data(inputs, targets, alpha=0.4)
+# outputs = model(inputs)
+# loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)`
+  },
+  {
+    title: "10. [Regularization] Label Smoothing",
+    category: "Augmentation",
+    description: "Prevents over-confidence. Use this instead of vanilla CrossEntropy.",
+    code: `import torch.nn as nn
+
+# Modern PyTorch
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+# Or manual (if needed for old versions):
+# confidence = 1.0 - epsilon
+# smooth_prob = epsilon / (num_classes - 1)
+# ...`
+  },
+
+  // --- SECTION 4: ADVANCED / SPECIFIC ---
+  {
+    title: "11. [Advanced] ArcFace Head",
+    category: "Advanced",
+    description: "Essential for 'Identity' tasks (Whales, Landmarks). Maximizes inter-class separability.",
+    code: `import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+class ArcMarginProduct(nn.Module):
+    def __init__(self, in_features, out_features, s=30.0, m=0.50):
+        super(ArcMarginProduct, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.s = s
+        self.m = m
+        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, input, label):
+        # cosine = input_norm * weight_norm
+        cosine = F.linear(F.normalize(input), F.normalize(self.weight))
+        phi = cosine - self.m
+        
+        # one_hot label conversion
+        one_hot = torch.zeros(cosine.size(), device=input.device)
+        one_hot.scatter_(1, label.view(-1, 1).long(), 1)
+        
+        output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+        output *= self.s
+        return output`
+  },
+
+  // --- SECTION 5: INFERENCE (The Winning Edge) ---
+  {
+    title: "12. [Inference] TTA (Test Time Aug)",
+    category: "Inference",
+    description: "Cheap score boost. Average predictions on augmented inputs (Flip, Crop).",
+    code: `model.eval()
+all_probs = []
+
+with torch.no_grad():
+    for images in test_loader:
+        images = images.to(device)
+        
+        # 1. Original
+        out1 = model(images).softmax(1)
+        
+        # 2. Horizontal Flip
+        out2 = model(torch.flip(images, dims=[3])).softmax(1) 
+        
+        # 3. Vertical Flip (if relevant)
+        out3 = model(torch.flip(images, dims=[2])).softmax(1)
+
+        avg_preds = (out1 + out2 + out3) / 3
+        all_probs.append(avg_preds)`
+  },
+  {
+    title: "13. [Inference] Ensembling",
+    category: "Inference",
+    description: "The final step. Combine models with low correlation for maximum score.",
+    code: `import numpy as np
+
+# Probs from Model A (e.g., EfficientNet)
+probs_a = np.load('effnet_oof.npy') 
+# Probs from Model B (e.g., Swin Transformer)
+probs_b = np.load('swin_oof.npy')
+
+# Optimize weights on OOF (e.g., using scipy.optimize or simple grid search)
+w_a = 0.6
+w_b = 0.4
+
+ensemble_probs = w_a * probs_a + w_b * probs_b
+# final_preds = np.argmax(ensemble_probs, axis=1)`
+  }
+];
 
 const IMAGE_WEEKS: Week[] = [
   {
@@ -213,6 +573,7 @@ const IMAGE_WEEKS: Week[] = [
   }
 ];
 
+// ... (other weeks remain unchanged, just updating Image track)
 const AUDIO_WEEKS: Week[] = [
   {
     id: 1,
@@ -1112,7 +1473,8 @@ export const TRACKS: Track[] = [
     id: 'image',
     title: 'Image / Classification',
     description: 'Master Computer Vision from MNIST to Metric Learning',
-    weeks: IMAGE_WEEKS
+    weeks: IMAGE_WEEKS,
+    snippets: IMAGE_SNIPPETS
   },
   {
     id: 'detection',
