@@ -360,6 +360,448 @@ ensemble_probs = w_a * probs_a + w_b * probs_b
   }
 ];
 
+const TABULAR_SNIPPETS: CodeSnippet[] = [
+  // --- SECTION 1: BASELINE (First valid submission) ---
+  {
+    title: "01. [Baseline] Load + Quick EDA",
+    category: "Baseline",
+    description: "The first 5 minutes: understand shape, target, missing values, duplicates, and categorical cardinality.",
+    code: `import pandas as pd
+import numpy as np
+
+train = pd.read_csv('/kaggle/input/competition/train.csv')
+test = pd.read_csv('/kaggle/input/competition/test.csv')
+sample = pd.read_csv('/kaggle/input/competition/sample_submission.csv')
+
+TARGET = 'target'
+ID_COL = 'id'
+
+print('train:', train.shape)
+print('test :', test.shape)
+print('sample:', sample.shape)
+
+display(train.head())
+display(test.head())
+display(sample.head())
+
+print(train.info())
+display(train.describe(include='all').T)
+
+print('target distribution:')
+display(train[TARGET].value_counts(dropna=False).head(20))
+
+missing = train.isna().mean().sort_values(ascending=False)
+display(missing[missing > 0].head(30))
+
+print('duplicates:', train.duplicated().sum())
+
+cat_cols = train.select_dtypes(include=['object', 'category', 'bool']).columns.tolist()
+cardinality = train[cat_cols].nunique(dropna=False).sort_values(ascending=False)
+display(cardinality.head(30))`
+  },
+  {
+    title: "02. [Baseline] Submission Contract",
+    category: "Baseline",
+    description: "Never guess the submission format. Read sample_submission and preserve ids/order exactly.",
+    code: `sample = pd.read_csv('/kaggle/input/competition/sample_submission.csv')
+print(sample.head())
+print(sample.dtypes)
+print(sample.shape)
+
+id_col = sample.columns[0]
+pred_cols = sample.columns[1:]
+
+# Example: single target submission
+submission = sample.copy()
+submission[pred_cols[0]] = test_preds
+
+# Sanity checks
+assert submission.shape == sample.shape
+assert submission[id_col].equals(sample[id_col])
+assert submission.isna().sum().sum() == 0
+
+submission.to_csv('submission.csv', index=False)
+display(submission.head())`
+  },
+  {
+    title: "03. [Validation] Split Strategy Selector",
+    category: "Validation",
+    description: "Choose validation from the data-generating process: stratified, grouped, regression, or time-based.",
+    code: `from sklearn.model_selection import KFold, StratifiedKFold, GroupKFold
+
+TARGET = 'target'
+N_SPLITS = 5
+SEED = 42
+
+def add_folds(df, target=TARGET, task='classification', group_col=None, date_col=None):
+    df = df.copy()
+    df['fold'] = -1
+
+    if date_col is not None:
+        # For true time-series, prefer a dedicated time split snippet.
+        df = df.sort_values(date_col).reset_index(drop=True)
+        fold_size = len(df) // N_SPLITS
+        for fold in range(N_SPLITS):
+            start = fold * fold_size
+            end = len(df) if fold == N_SPLITS - 1 else (fold + 1) * fold_size
+            df.loc[start:end - 1, 'fold'] = fold
+        return df
+
+    if group_col is not None:
+        splitter = GroupKFold(n_splits=N_SPLITS)
+        split = splitter.split(df, df[target], groups=df[group_col])
+    elif task == 'classification':
+        splitter = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
+        split = splitter.split(df, df[target])
+    else:
+        splitter = KFold(n_splits=N_SPLITS, shuffle=True, random_state=SEED)
+        split = splitter.split(df)
+
+    for fold, (_, valid_idx) in enumerate(split):
+        df.loc[valid_idx, 'fold'] = fold
+    return df
+
+train = add_folds(train, task='classification')
+display(train['fold'].value_counts().sort_index())`
+  },
+  {
+    title: "04. [Validation] Time-Based Split",
+    category: "Validation",
+    description: "For sports, sales, finance, and logs: validate on the future, never on shuffled rows.",
+    code: `DATE_COL = 'date'
+TARGET = 'target'
+
+df = train.copy()
+df[DATE_COL] = pd.to_datetime(df[DATE_COL])
+df = df.sort_values(DATE_COL).reset_index(drop=True)
+
+valid_frac = 0.2
+cut = int(len(df) * (1 - valid_frac))
+
+train_df = df.iloc[:cut].reset_index(drop=True)
+valid_df = df.iloc[cut:].reset_index(drop=True)
+
+print(train_df[DATE_COL].min(), '->', train_df[DATE_COL].max(), train_df.shape)
+print(valid_df[DATE_COL].min(), '->', valid_df[DATE_COL].max(), valid_df.shape)
+
+assert train_df[DATE_COL].max() <= valid_df[DATE_COL].min()
+
+features = [c for c in df.columns if c not in [TARGET, DATE_COL]]
+X_train, y_train = train_df[features], train_df[TARGET]
+X_valid, y_valid = valid_df[features], valid_df[TARGET]`
+  },
+  {
+    title: "05. [Baseline] CatBoost",
+    category: "Baseline",
+    description: "Strong default for messy tabular data with categorical features. Great first serious submission.",
+    code: `from catboost import CatBoostClassifier, CatBoostRegressor
+from sklearn.metrics import roc_auc_score, accuracy_score, mean_squared_error
+
+TARGET = 'target'
+DROP_COLS = ['fold', TARGET]
+
+features = [c for c in train.columns if c not in DROP_COLS]
+cat_cols = train[features].select_dtypes(include=['object', 'category', 'bool']).columns.tolist()
+
+fold = 0
+train_df = train[train['fold'] != fold].reset_index(drop=True)
+valid_df = train[train['fold'] == fold].reset_index(drop=True)
+
+model = CatBoostClassifier(
+    iterations=2000,
+    learning_rate=0.03,
+    depth=6,
+    loss_function='Logloss',
+    eval_metric='AUC',
+    random_seed=42,
+    verbose=200,
+    early_stopping_rounds=100,
+    allow_writing_files=False
+)
+
+model.fit(
+    train_df[features], train_df[TARGET],
+    eval_set=(valid_df[features], valid_df[TARGET]),
+    cat_features=cat_cols
+)
+
+valid_pred = model.predict_proba(valid_df[features])[:, 1]
+print('AUC:', roc_auc_score(valid_df[TARGET], valid_pred))
+
+test_pred = model.predict_proba(test[features])[:, 1]`
+  },
+  {
+    title: "06. [Baseline] LightGBM",
+    category: "Baseline",
+    description: "Fast gradient boosting baseline. Useful for large data and quick iteration.",
+    code: `import lightgbm as lgb
+from sklearn.metrics import roc_auc_score
+
+TARGET = 'target'
+features = [c for c in train.columns if c not in ['fold', TARGET]]
+cat_cols = train[features].select_dtypes(include=['object', 'category', 'bool']).columns.tolist()
+
+for col in cat_cols:
+    train[col] = train[col].astype('category')
+    test[col] = test[col].astype('category')
+
+fold = 0
+train_df = train[train['fold'] != fold].reset_index(drop=True)
+valid_df = train[train['fold'] == fold].reset_index(drop=True)
+
+model = lgb.LGBMClassifier(
+    n_estimators=5000,
+    learning_rate=0.03,
+    num_leaves=64,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    random_state=42,
+    n_jobs=-1
+)
+
+model.fit(
+    train_df[features], train_df[TARGET],
+    eval_set=[(valid_df[features], valid_df[TARGET])],
+    eval_metric='auc',
+    callbacks=[lgb.early_stopping(100), lgb.log_evaluation(200)]
+)
+
+valid_pred = model.predict_proba(valid_df[features])[:, 1]
+print('AUC:', roc_auc_score(valid_df[TARGET], valid_pred))
+
+test_pred = model.predict_proba(test[features])[:, 1]`
+  },
+  {
+    title: "07. [Preprocessing] Column Type Detector",
+    category: "Preprocessing",
+    description: "Create a clean feature map before modeling: ids, dates, categorical, numeric, and constants.",
+    code: `def detect_columns(train, test=None, target='target'):
+    cols = [c for c in train.columns if c != target]
+    
+    id_cols = [c for c in cols if c.lower() in ['id', 'row_id'] or c.lower().endswith('_id')]
+    constant_cols = [c for c in cols if train[c].nunique(dropna=False) <= 1]
+    
+    date_cols = []
+    for c in cols:
+        if train[c].dtype == 'object' and ('date' in c.lower() or 'time' in c.lower()):
+            date_cols.append(c)
+        elif np.issubdtype(train[c].dtype, np.datetime64):
+            date_cols.append(c)
+    
+    cat_cols = train[cols].select_dtypes(include=['object', 'category', 'bool']).columns.tolist()
+    num_cols = train[cols].select_dtypes(include=[np.number]).columns.tolist()
+    
+    drop_cols = sorted(set(id_cols + constant_cols))
+    feature_cols = [c for c in cols if c not in drop_cols]
+    
+    return {
+        'features': feature_cols,
+        'numeric': [c for c in num_cols if c in feature_cols],
+        'categorical': [c for c in cat_cols if c in feature_cols],
+        'dates': [c for c in date_cols if c in feature_cols],
+        'ids': id_cols,
+        'constants': constant_cols,
+        'drop': drop_cols
+    }
+
+cols = detect_columns(train, test, target='target')
+for key, value in cols.items():
+    print(key, len(value), value[:20])`
+  },
+  {
+    title: "08. [Features] Date Features",
+    category: "Features",
+    description: "Turn dates into robust numeric features. Works for matches, sales, events, and logs.",
+    code: `def add_date_features(df, date_col):
+    df = df.copy()
+    dt = pd.to_datetime(df[date_col])
+    
+    df[f'{date_col}_year'] = dt.dt.year
+    df[f'{date_col}_month'] = dt.dt.month
+    df[f'{date_col}_day'] = dt.dt.day
+    df[f'{date_col}_dayofweek'] = dt.dt.dayofweek
+    df[f'{date_col}_weekofyear'] = dt.dt.isocalendar().week.astype(int)
+    df[f'{date_col}_is_weekend'] = (dt.dt.dayofweek >= 5).astype(int)
+    df[f'{date_col}_days_from_start'] = (dt - dt.min()).dt.days
+    
+    return df
+
+for col in ['date']:
+    train = add_date_features(train, col)
+    test = add_date_features(test, col)`
+  },
+  {
+    title: "09. [Features] Groupby Aggregations",
+    category: "Features",
+    description: "Classic tabular lift: summarize numeric behavior by team, user, product, category, city, etc.",
+    code: `def add_groupby_aggregations(train, test, group_cols, agg_cols, stats=('mean', 'std', 'min', 'max', 'count')):
+    train = train.copy()
+    test = test.copy()
+    full = pd.concat([train.drop(columns=['target'], errors='ignore'), test], axis=0, ignore_index=True)
+
+    for group_col in group_cols:
+        for agg_col in agg_cols:
+            agg = full.groupby(group_col)[agg_col].agg(stats)
+            agg.columns = [f'{group_col}_{agg_col}_{stat}' for stat in stats]
+            
+            train = train.merge(agg, on=group_col, how='left')
+            test = test.merge(agg, on=group_col, how='left')
+
+    return train, test
+
+group_cols = ['team']
+agg_cols = ['goals_for', 'goals_against']
+
+train, test = add_groupby_aggregations(train, test, group_cols, agg_cols)`
+  },
+  {
+    title: "10. [Features] Rolling Features Without Leakage",
+    category: "Features",
+    description: "For ordered data: compute team/user history using shift(1), so the current row never sees its own target.",
+    code: `def add_rolling_features(df, group_col, date_col, value_cols, windows=(3, 5, 10)):
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col])
+    df = df.sort_values([group_col, date_col]).reset_index(drop=True)
+    
+    for value_col in value_cols:
+        shifted = df.groupby(group_col)[value_col].shift(1)
+        
+        for window in windows:
+            name = f'{group_col}_{value_col}_roll{window}_mean'
+            df[name] = (
+                shifted
+                .groupby(df[group_col])
+                .rolling(window, min_periods=1)
+                .mean()
+                .reset_index(level=0, drop=True)
+            )
+        
+        df[f'{group_col}_{value_col}_expanding_mean'] = (
+            shifted
+            .groupby(df[group_col])
+            .expanding(min_periods=1)
+            .mean()
+            .reset_index(level=0, drop=True)
+        )
+    
+    return df
+
+# Example: team form before each match
+train = add_rolling_features(
+    train,
+    group_col='team',
+    date_col='date',
+    value_cols=['goals_for', 'goals_against'],
+    windows=(3, 5)
+)`
+  },
+  {
+    title: "11. [Encoding] OOF Target Encoding",
+    category: "Encoding",
+    description: "High-cardinality categorical encoding without leakage. Fit mapping only on the training folds.",
+    code: `from sklearn.model_selection import StratifiedKFold
+
+def oof_target_encode(train, test, col, target, n_splits=5, smoothing=20, seed=42):
+    train = train.copy()
+    test = test.copy()
+    global_mean = train[target].mean()
+    encoded_col = f'{col}_target_enc'
+    train[encoded_col] = np.nan
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    for tr_idx, val_idx in skf.split(train, train[target]):
+        tr = train.iloc[tr_idx]
+        stats = tr.groupby(col)[target].agg(['mean', 'count'])
+        smooth = (stats['mean'] * stats['count'] + global_mean * smoothing) / (stats['count'] + smoothing)
+        train.loc[val_idx, encoded_col] = train.loc[val_idx, col].map(smooth)
+
+    full_stats = train.groupby(col)[target].agg(['mean', 'count'])
+    full_smooth = (full_stats['mean'] * full_stats['count'] + global_mean * smoothing) / (full_stats['count'] + smoothing)
+    test[encoded_col] = test[col].map(full_smooth)
+
+    train[encoded_col] = train[encoded_col].fillna(global_mean)
+    test[encoded_col] = test[encoded_col].fillna(global_mean)
+    return train, test
+
+for col in ['team', 'opponent']:
+    train, test = oof_target_encode(train, test, col=col, target='target')`
+  },
+  {
+    title: "12. [Training] OOF Loop + Test Averaging",
+    category: "Training",
+    description: "The core Kaggle pattern: train each fold, store OOF predictions, average test predictions.",
+    code: `from catboost import CatBoostClassifier
+from sklearn.metrics import roc_auc_score
+
+TARGET = 'target'
+features = [c for c in train.columns if c not in ['fold', TARGET]]
+cat_cols = train[features].select_dtypes(include=['object', 'category', 'bool']).columns.tolist()
+
+oof = np.zeros(len(train))
+test_preds = np.zeros(len(test))
+
+for fold in sorted(train['fold'].unique()):
+    print(f'Fold {fold}')
+    valid_idx = train.index[train['fold'] == fold]
+    train_df = train[train['fold'] != fold].reset_index(drop=True)
+    valid_df = train.loc[valid_idx].reset_index(drop=True)
+    
+    model = CatBoostClassifier(
+        iterations=3000,
+        learning_rate=0.03,
+        depth=6,
+        loss_function='Logloss',
+        eval_metric='AUC',
+        random_seed=42 + fold,
+        early_stopping_rounds=150,
+        verbose=300,
+        allow_writing_files=False
+    )
+    
+    model.fit(
+        train_df[features], train_df[TARGET],
+        eval_set=(valid_df[features], valid_df[TARGET]),
+        cat_features=cat_cols
+    )
+    
+    oof[valid_idx] = model.predict_proba(valid_df[features])[:, 1]
+    test_preds += model.predict_proba(test[features])[:, 1] / train['fold'].nunique()
+
+print('OOF AUC:', roc_auc_score(train[TARGET], oof))`
+  },
+  {
+    title: "13. [Inference] Thresholding + Blending",
+    category: "Inference",
+    description: "Optimize thresholds on OOF for F1 and blend models using validation, not leaderboard guessing.",
+    code: `from sklearn.metrics import f1_score
+
+def find_best_threshold(y_true, probs):
+    best_thr, best_score = 0.5, -1
+    for thr in np.linspace(0.01, 0.99, 99):
+        score = f1_score(y_true, probs >= thr)
+        if score > best_score:
+            best_thr, best_score = thr, score
+    return best_thr, best_score
+
+# Threshold optimization
+best_thr, best_f1 = find_best_threshold(train['target'].values, oof_cat)
+print('best threshold:', best_thr, 'OOF F1:', best_f1)
+
+final_binary_preds = (test_preds_cat >= best_thr).astype(int)
+
+# Simple OOF-weighted blending
+best_w, best_auc = 0.5, -1
+for w in np.linspace(0, 1, 21):
+    blend_oof = w * oof_cat + (1 - w) * oof_lgb
+    score = roc_auc_score(train['target'], blend_oof)
+    if score > best_auc:
+        best_w, best_auc = w, score
+
+print('best blend weight:', best_w, 'OOF AUC:', best_auc)
+blend_test = best_w * test_preds_cat + (1 - best_w) * test_preds_lgb`
+  }
+];
+
 const IMAGE_WEEKS: Week[] = [
   {
     id: 1,
@@ -1498,7 +1940,8 @@ export const TRACKS: Track[] = [
     id: 'tabular',
     title: 'Tabular / Structured',
     description: 'From EDA to Ensembles: Mastering Structured Data',
-    weeks: TABULAR_WEEKS
+    weeks: TABULAR_WEEKS,
+    snippets: TABULAR_SNIPPETS
   }
 ];
 
