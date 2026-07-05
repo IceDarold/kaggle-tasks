@@ -802,6 +802,666 @@ blend_test = best_w * test_preds_cat + (1 - best_w) * test_preds_lgb`
   }
 ];
 
+const SEGMENTATION_SNIPPETS: CodeSnippet[] = [
+  // --- SECTION 1: BASELINE (Understand the task contract) ---
+  {
+    title: "01. [Baseline] Inspect Files + Submission",
+    category: "Baseline",
+    description: "Start by finding images, labels, mask format, empty masks, and the exact submission columns.",
+    code: `from pathlib import Path
+import pandas as pd
+import numpy as np
+
+ROOT = Path('/kaggle/input/competition')
+
+print('top-level files:')
+for path in sorted(ROOT.iterdir()):
+    print(path)
+
+csv_files = sorted(ROOT.rglob('*.csv'))
+print('csv files:', [str(p) for p in csv_files])
+
+train = pd.read_csv(ROOT / 'train.csv')
+sample = pd.read_csv(ROOT / 'sample_submission.csv')
+
+display(train.head())
+display(sample.head())
+print('train shape:', train.shape)
+print('sample shape:', sample.shape)
+print(train.dtypes)
+
+image_dirs = [p for p in ROOT.rglob('*') if p.is_dir() and any(p.glob('*.jpg'))]
+image_dirs += [p for p in ROOT.rglob('*') if p.is_dir() and any(p.glob('*.png'))]
+print('image dirs:', image_dirs[:10])
+
+for col in train.columns:
+    if train[col].dtype == 'object':
+        print(col, 'nunique=', train[col].nunique(dropna=False), 'missing=', train[col].isna().mean())`
+  },
+  {
+    title: "02. [Masks] RLE Decode / Encode",
+    category: "Masks",
+    description: "Kaggle segmentation often uses column-major RLE. Keep decode, encode, and roundtrip check together.",
+    code: `import numpy as np
+import pandas as pd
+
+def rle_decode(mask_rle, shape):
+    if pd.isna(mask_rle) or mask_rle == '' or mask_rle == '-1':
+        return np.zeros(shape, dtype=np.uint8)
+    
+    s = str(mask_rle).split()
+    starts = np.asarray(s[0::2], dtype=np.int64) - 1
+    lengths = np.asarray(s[1::2], dtype=np.int64)
+    ends = starts + lengths
+    
+    mask = np.zeros(shape[0] * shape[1], dtype=np.uint8)
+    for lo, hi in zip(starts, ends):
+        mask[lo:hi] = 1
+    
+    return mask.reshape(shape, order='F')
+
+def rle_encode(mask):
+    pixels = np.asarray(mask, dtype=np.uint8).reshape(-1, order='F')
+    pixels = np.concatenate([[0], pixels, [0]])
+    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
+    runs[1::2] -= runs[::2]
+    return ' '.join(str(x) for x in runs)
+
+# Roundtrip sanity check
+dummy = np.zeros((8, 8), dtype=np.uint8)
+dummy[2:5, 3:6] = 1
+encoded = rle_encode(dummy)
+decoded = rle_decode(encoded, dummy.shape)
+assert np.array_equal(dummy, decoded)
+print('RLE OK:', encoded)`
+  },
+  {
+    title: "03. [Masks] Build Mask From Labels",
+    category: "Masks",
+    description: "Convert per-image label rows into a binary or C-channel mask tensor.",
+    code: `import numpy as np
+import pandas as pd
+
+def build_mask_from_labels(labels, image_id, shape, image_col='image_id', rle_col='EncodedPixels',
+                           class_col=None, num_classes=None):
+    rows = labels[labels[image_col] == image_id]
+    
+    if num_classes is None:
+        mask = np.zeros(shape, dtype=np.uint8)
+        for rle in rows[rle_col].dropna().values:
+            mask |= rle_decode(rle, shape)
+        return mask
+    
+    mask = np.zeros((num_classes, shape[0], shape[1]), dtype=np.uint8)
+    for _, row in rows.iterrows():
+        rle = row[rle_col]
+        if pd.isna(rle) or rle == '' or rle == '-1':
+            continue
+        cls = int(row[class_col]) - 1
+        mask[cls] |= rle_decode(rle, shape)
+    return mask
+
+# Binary example
+# mask = build_mask_from_labels(train, image_id='0001.jpg', shape=(256, 1600))
+
+# Multiclass example
+# mask = build_mask_from_labels(train, '0001.jpg', (256, 1600), class_col='class_id', num_classes=4)`
+  },
+  {
+    title: "04. [Visualization] Image + Mask Overlay",
+    category: "Visualization",
+    description: "Always visualize image, mask, and overlay before training. This catches alignment and RLE mistakes.",
+    code: `import cv2
+import matplotlib.pyplot as plt
+
+def read_image(path):
+    image = cv2.imread(str(path))
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    return image
+
+def show_image_mask(image, mask, title=None, alpha=0.45):
+    if mask.ndim == 3:
+        mask2d = mask.max(axis=0)
+    else:
+        mask2d = mask
+    
+    overlay = image.copy()
+    color = np.zeros_like(image)
+    color[..., 0] = 255
+    overlay = np.where(mask2d[..., None] > 0, (1 - alpha) * overlay + alpha * color, overlay)
+    overlay = overlay.astype(np.uint8)
+    
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    axes[0].imshow(image)
+    axes[0].set_title('image')
+    axes[1].imshow(mask2d, cmap='gray')
+    axes[1].set_title('mask')
+    axes[2].imshow(overlay)
+    axes[2].set_title('overlay')
+    
+    if title:
+        fig.suptitle(title)
+    for ax in axes:
+        ax.axis('off')
+    plt.show()
+
+# image = read_image(TRAIN_IMAGE_DIR / image_id)
+# mask = build_mask_from_labels(train, image_id, shape=image.shape[:2])
+# show_image_mask(image, mask, image_id)`
+  },
+  {
+    title: "05. [Validation] Stratified Split By Mask Area",
+    category: "Validation",
+    description: "Preserve empty/non-empty ratio and rough mask size distribution across folds.",
+    code: `import numpy as np
+import pandas as pd
+from sklearn.model_selection import StratifiedKFold
+
+def rle_area(mask_rle):
+    if pd.isna(mask_rle) or mask_rle == '' or mask_rle == '-1':
+        return 0
+    lengths = np.asarray(str(mask_rle).split()[1::2], dtype=np.int64)
+    return int(lengths.sum())
+
+def make_image_level_folds(labels, image_col='image_id', rle_col='EncodedPixels', n_splits=5, seed=42):
+    meta = (
+        labels
+        .assign(mask_area=labels[rle_col].map(rle_area))
+        .groupby(image_col, as_index=False)['mask_area']
+        .sum()
+    )
+    meta['has_mask'] = (meta['mask_area'] > 0).astype(int)
+    meta['area_bin'] = 0
+    
+    non_empty = meta['mask_area'] > 0
+    if non_empty.sum() > 1:
+        q = min(4, non_empty.sum())
+        meta.loc[non_empty, 'area_bin'] = (
+            pd.qcut(meta.loc[non_empty, 'mask_area'], q=q, labels=False, duplicates='drop')
+            .astype(int) + 1
+        )
+    
+    meta['stratify'] = meta['has_mask'].astype(str) + '_' + meta['area_bin'].astype(str)
+    meta['fold'] = -1
+    
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    for fold, (_, valid_idx) in enumerate(skf.split(meta, meta['stratify'])):
+        meta.loc[valid_idx, 'fold'] = fold
+    
+    return meta
+
+image_df = make_image_level_folds(train)
+display(pd.crosstab(image_df['fold'], image_df['has_mask']))`
+  },
+  {
+    title: "06. [Validation] Group Split",
+    category: "Validation",
+    description: "If images share patient, video, scene, or case ids, split by group to avoid near-duplicate leakage.",
+    code: `from sklearn.model_selection import GroupKFold
+
+def add_group_folds(image_df, group_col, n_splits=5):
+    image_df = image_df.copy()
+    image_df['fold'] = -1
+    
+    splitter = GroupKFold(n_splits=n_splits)
+    for fold, (_, valid_idx) in enumerate(splitter.split(image_df, groups=image_df[group_col])):
+        image_df.loc[valid_idx, 'fold'] = fold
+    
+    return image_df
+
+# Example:
+# image_df = add_group_folds(image_df, group_col='patient_id')
+# for fold in sorted(image_df['fold'].unique()):
+#     valid_groups = set(image_df.loc[image_df['fold'] == fold, 'patient_id'])
+#     train_groups = set(image_df.loc[image_df['fold'] != fold, 'patient_id'])
+#     assert valid_groups.isdisjoint(train_groups)`
+  },
+  {
+    title: "07. [Dataset] Binary Segmentation Dataset",
+    category: "Dataset",
+    description: "Dataset for one foreground mask. Returns image tensor and mask tensor with shape 1 x H x W.",
+    code: `from pathlib import Path
+import torch
+from torch.utils.data import Dataset
+
+class BinarySegDataset(Dataset):
+    def __init__(self, image_df, labels, image_dir, image_col='image_id', rle_col='EncodedPixels',
+                 transforms=None, mode='train', mask_shape=None):
+        self.image_df = image_df.reset_index(drop=True)
+        self.labels = labels
+        self.image_dir = Path(image_dir)
+        self.image_col = image_col
+        self.rle_col = rle_col
+        self.transforms = transforms
+        self.mode = mode
+        self.mask_shape = mask_shape
+        self.rles_by_image = labels.groupby(image_col)[rle_col].apply(list).to_dict()
+    
+    def __len__(self):
+        return len(self.image_df)
+    
+    def __getitem__(self, idx):
+        image_id = self.image_df.loc[idx, self.image_col]
+        image = read_image(self.image_dir / image_id)
+        
+        if self.mode != 'test':
+            shape = self.mask_shape or image.shape[:2]
+            mask = np.zeros(shape, dtype=np.uint8)
+            for rle in self.rles_by_image.get(image_id, []):
+                mask |= rle_decode(rle, shape)
+            
+            if self.transforms:
+                augmented = self.transforms(image=image, mask=mask)
+                image, mask = augmented['image'], augmented['mask']
+            
+            if mask.ndim == 2:
+                mask = mask.unsqueeze(0) if torch.is_tensor(mask) else mask[None]
+            mask = mask.float() if torch.is_tensor(mask) else torch.tensor(mask, dtype=torch.float32)
+            return image, mask
+        
+        if self.transforms:
+            image = self.transforms(image=image)['image']
+        return image, image_id`
+  },
+  {
+    title: "08. [Dataset] Multiclass Segmentation Dataset",
+    category: "Dataset",
+    description: "Dataset for C independent defect classes. Useful for Severstal-like multilabel masks.",
+    code: `from pathlib import Path
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+
+class MulticlassSegDataset(Dataset):
+    def __init__(self, image_df, labels, image_dir, num_classes, image_col='image_id',
+                 rle_col='EncodedPixels', class_col='class_id', transforms=None, mode='train',
+                 mask_shape=None):
+        self.image_df = image_df.reset_index(drop=True)
+        self.labels = labels
+        self.image_dir = Path(image_dir)
+        self.num_classes = num_classes
+        self.image_col = image_col
+        self.rle_col = rle_col
+        self.class_col = class_col
+        self.transforms = transforms
+        self.mode = mode
+        self.mask_shape = mask_shape
+        self.rows_by_image = {k: v for k, v in labels.groupby(image_col)}
+    
+    def __len__(self):
+        return len(self.image_df)
+    
+    def __getitem__(self, idx):
+        image_id = self.image_df.loc[idx, self.image_col]
+        image = read_image(self.image_dir / image_id)
+        
+        if self.mode == 'test':
+            if self.transforms:
+                image = self.transforms(image=image)['image']
+            return image, image_id
+        
+        shape = self.mask_shape or image.shape[:2]
+        mask = np.zeros((shape[0], shape[1], self.num_classes), dtype=np.uint8)
+        rows = self.rows_by_image.get(image_id)
+        if rows is not None:
+            for _, row in rows.iterrows():
+                if pd.isna(row[self.rle_col]) or row[self.rle_col] == '-1':
+                    continue
+                cls = int(row[self.class_col]) - 1
+                mask[..., cls] |= rle_decode(row[self.rle_col], shape)
+        
+        if self.transforms:
+            augmented = self.transforms(image=image, mask=mask)
+            image, mask = augmented['image'], augmented['mask']
+        
+        if mask.ndim == 3 and not torch.is_tensor(mask):
+            mask = np.transpose(mask, (2, 0, 1))
+        elif torch.is_tensor(mask) and mask.ndim == 3:
+            mask = mask.permute(2, 0, 1)
+        mask = mask.float() if torch.is_tensor(mask) else torch.tensor(mask, dtype=torch.float32)
+        return image, mask`
+  },
+  {
+    title: "09. [Augmentation] Safe Segmentation Transforms",
+    category: "Augmentation",
+    description: "Use transforms that move image and mask together. Keep geometry modest until the pipeline is proven.",
+    code: `import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+def get_train_transforms(size):
+    return A.Compose([
+        A.Resize(size, size),
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.ShiftScaleRotate(
+            shift_limit=0.05,
+            scale_limit=0.10,
+            rotate_limit=15,
+            border_mode=0,
+            p=0.5
+        ),
+        A.OneOf([
+            A.RandomBrightnessContrast(p=1.0),
+            A.HueSaturationValue(p=1.0),
+        ], p=0.4),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ])
+
+def get_valid_transforms(size):
+    return A.Compose([
+        A.Resize(size, size),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ])`
+  },
+  {
+    title: "10. [Model] Pretrained U-Net / FPN",
+    category: "Model",
+    description: "Fast strong baseline using segmentation_models_pytorch. Swap encoder and classes without rewriting training.",
+    code: `# Kaggle if missing:
+# !pip install -q segmentation-models-pytorch
+
+import torch
+import segmentation_models_pytorch as smp
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+def build_seg_model(architecture='unet', encoder='resnet34', in_channels=3, classes=1):
+    if architecture == 'unet':
+        return smp.Unet(
+            encoder_name=encoder,
+            encoder_weights='imagenet',
+            in_channels=in_channels,
+            classes=classes,
+            activation=None
+        )
+    
+    if architecture == 'fpn':
+        return smp.FPN(
+            encoder_name=encoder,
+            encoder_weights='imagenet',
+            in_channels=in_channels,
+            classes=classes,
+            activation=None
+        )
+    
+    raise ValueError(f'unknown architecture: {architecture}')
+
+model = build_seg_model(architecture='unet', encoder='resnet34', classes=1)
+model = model.to(device)`
+  },
+  {
+    title: "11. [Loss] BCE + Dice Loss",
+    category: "Loss",
+    description: "Robust default for binary or multilabel segmentation. BCE stabilizes pixels; Dice optimizes overlap.",
+    code: `import torch
+import torch.nn as nn
+
+class DiceLoss(nn.Module):
+    def __init__(self, eps=1e-7):
+        super().__init__()
+        self.eps = eps
+    
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
+        targets = targets.float()
+        
+        dims = (0, 2, 3)
+        intersection = torch.sum(probs * targets, dims)
+        cardinality = torch.sum(probs + targets, dims)
+        dice = (2.0 * intersection + self.eps) / (cardinality + self.eps)
+        return 1.0 - dice.mean()
+
+class BCEDiceLoss(nn.Module):
+    def __init__(self, bce_weight=0.5):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss()
+        self.dice = DiceLoss()
+        self.bce_weight = bce_weight
+    
+    def forward(self, logits, targets):
+        return self.bce_weight * self.bce(logits, targets.float()) + (1 - self.bce_weight) * self.dice(logits, targets)
+
+criterion = BCEDiceLoss(bce_weight=0.5)`
+  },
+  {
+    title: "12. [Metrics] Dice / IoU",
+    category: "Metrics",
+    description: "Compute competition-like overlap metrics from logits with an explicit threshold.",
+    code: `import torch
+
+def dice_score(logits, targets, threshold=0.5, eps=1e-7):
+    probs = torch.sigmoid(logits)
+    preds = (probs > threshold).float()
+    targets = targets.float()
+    
+    dims = (0, 2, 3)
+    intersection = torch.sum(preds * targets, dims)
+    cardinality = torch.sum(preds + targets, dims)
+    dice = (2.0 * intersection + eps) / (cardinality + eps)
+    return dice.mean().item()
+
+def iou_score(logits, targets, threshold=0.5, eps=1e-7):
+    probs = torch.sigmoid(logits)
+    preds = (probs > threshold).float()
+    targets = targets.float()
+    
+    dims = (0, 2, 3)
+    intersection = torch.sum(preds * targets, dims)
+    union = torch.sum(preds + targets, dims) - intersection
+    iou = (intersection + eps) / (union + eps)
+    return iou.mean().item()
+
+# valid_dice = dice_score(logits, masks, threshold=0.5)`
+  },
+  {
+    title: "13. [Training] AMP Train One Epoch",
+    category: "Training",
+    description: "One focused training loop. Keep it small so errors are easy to localize.",
+    code: `import numpy as np
+from torch.cuda.amp import autocast, GradScaler
+from tqdm.auto import tqdm
+
+scaler = GradScaler()
+
+def train_one_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    losses = []
+    
+    for images, masks in tqdm(loader, desc='train'):
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+        
+        optimizer.zero_grad(set_to_none=True)
+        with autocast():
+            logits = model(images)
+            loss = criterion(logits, masks)
+        
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        
+        losses.append(loss.item())
+    
+    return float(np.mean(losses))`
+  },
+  {
+    title: "14. [Validation] Valid Loop + Threshold Search",
+    category: "Validation",
+    description: "Collect validation probabilities once, then choose the threshold that maximizes Dice or IoU.",
+    code: `import numpy as np
+import torch
+from tqdm.auto import tqdm
+
+@torch.no_grad()
+def predict_valid(model, loader, device):
+    model.eval()
+    probs_all, masks_all = [], []
+    
+    for images, masks in tqdm(loader, desc='valid'):
+        images = images.to(device, non_blocking=True)
+        logits = model(images)
+        probs = torch.sigmoid(logits).cpu()
+        probs_all.append(probs)
+        masks_all.append(masks.cpu())
+    
+    return torch.cat(probs_all), torch.cat(masks_all)
+
+def dice_from_probs(probs, masks, threshold=0.5, eps=1e-7):
+    preds = (probs > threshold).float()
+    masks = masks.float()
+    dims = (0, 2, 3)
+    inter = torch.sum(preds * masks, dims)
+    card = torch.sum(preds + masks, dims)
+    return (((2 * inter + eps) / (card + eps)).mean().item())
+
+def find_best_threshold(probs, masks):
+    best_thr, best_score = 0.5, -1
+    for thr in np.linspace(0.05, 0.95, 19):
+        score = dice_from_probs(probs, masks, threshold=float(thr))
+        if score > best_score:
+            best_thr, best_score = float(thr), score
+    return best_thr, best_score
+
+valid_probs, valid_masks = predict_valid(model, valid_loader, device)
+best_thr, best_dice = find_best_threshold(valid_probs, valid_masks)
+print('best threshold:', best_thr, 'dice:', best_dice)`
+  },
+  {
+    title: "15. [Inference] Flip TTA For Masks",
+    category: "Inference",
+    description: "Average original and flipped predictions, flipping logits back before aggregation.",
+    code: `import torch
+
+@torch.no_grad()
+def predict_with_tta(model, images):
+    model.eval()
+    
+    logits = model(images)
+    
+    h_logits = model(torch.flip(images, dims=[3]))
+    h_logits = torch.flip(h_logits, dims=[3])
+    
+    v_logits = model(torch.flip(images, dims=[2]))
+    v_logits = torch.flip(v_logits, dims=[2])
+    
+    avg_logits = (logits + h_logits + v_logits) / 3.0
+    return torch.sigmoid(avg_logits)
+
+# for images, image_ids in test_loader:
+#     images = images.to(device)
+#     probs = predict_with_tta(model, images).cpu().numpy()`
+  },
+  {
+    title: "16. [Postprocess] Remove Small Components",
+    category: "Postprocess",
+    description: "Remove tiny noisy blobs after thresholding. Useful for cracks, defects, and satellite masks.",
+    code: `import cv2
+
+def remove_small_components(mask, min_size=100):
+    mask = mask.astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    
+    cleaned = np.zeros_like(mask, dtype=np.uint8)
+    for label in range(1, num_labels):
+        area = stats[label, cv2.CC_STAT_AREA]
+        if area >= min_size:
+            cleaned[labels == label] = 1
+    
+    return cleaned
+
+def postprocess_mask(prob, threshold=0.5, min_size=100):
+    mask = (prob > threshold).astype(np.uint8)
+    return remove_small_components(mask, min_size=min_size)
+
+# mask = postprocess_mask(prob[0], threshold=best_thr, min_size=50)`
+  },
+  {
+    title: "17. [Submission] RLE Submission",
+    category: "Submission",
+    description: "Run test inference, resize masks back if needed, postprocess, encode to RLE, and preserve sample columns.",
+    code: `import pandas as pd
+import torch
+import torch.nn.functional as F
+from tqdm.auto import tqdm
+
+@torch.no_grad()
+def make_rle_submission(model, test_loader, sample, threshold=0.5, min_size=100,
+                        target_shape=None, id_col='image_id', pred_col='EncodedPixels'):
+    model.eval()
+    rows = []
+    
+    for images, image_ids in tqdm(test_loader, desc='test'):
+        images = images.to(device, non_blocking=True)
+        probs = predict_with_tta(model, images).cpu()
+        
+        if target_shape is not None and probs.shape[-2:] != target_shape:
+            probs = F.interpolate(probs, size=target_shape, mode='bilinear', align_corners=False)
+        
+        probs = probs.numpy()
+        for prob, image_id in zip(probs, image_ids):
+            mask = postprocess_mask(prob[0], threshold=threshold, min_size=min_size)
+            rle = rle_encode(mask)
+            rows.append({id_col: image_id, pred_col: rle})
+    
+    submission = pd.DataFrame(rows)
+    
+    if id_col in sample.columns:
+        submission = sample[[id_col]].merge(submission, on=id_col, how='left')
+        submission[pred_col] = submission[pred_col].fillna('')
+    
+    return submission
+
+submission = make_rle_submission(model, test_loader, sample, threshold=best_thr, min_size=50)
+submission.to_csv('submission.csv', index=False)
+display(submission.head())`
+  },
+  {
+    title: "18. [Debug] Visualize Predictions",
+    category: "Debug",
+    description: "Compare image, ground truth, prediction, and overlay on validation samples before trusting the score.",
+    code: `import numpy as np
+import torch
+import matplotlib.pyplot as plt
+
+@torch.no_grad()
+def visualize_predictions(model, dataset, indices, threshold=0.5, device='cuda'):
+    model.eval()
+    
+    for idx in indices:
+        image, true_mask = dataset[idx]
+        x = image.unsqueeze(0).to(device)
+        prob = torch.sigmoid(model(x)).cpu()[0, 0].numpy()
+        pred_mask = (prob > threshold).astype(np.uint8)
+        
+        img_np = image.permute(1, 2, 0).cpu().numpy()
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+        img_np = np.clip(img_np * std + mean, 0, 1)
+        
+        gt = true_mask[0].cpu().numpy()
+        
+        fig, axes = plt.subplots(1, 4, figsize=(18, 5))
+        axes[0].imshow(img_np)
+        axes[0].set_title('image')
+        axes[1].imshow(gt, cmap='gray')
+        axes[1].set_title('ground truth')
+        axes[2].imshow(pred_mask, cmap='gray')
+        axes[2].set_title('prediction')
+        axes[3].imshow(img_np)
+        axes[3].imshow(pred_mask, alpha=0.45, cmap='Reds')
+        axes[3].set_title('overlay')
+        
+        for ax in axes:
+            ax.axis('off')
+        plt.show()
+
+# visualize_predictions(model, valid_dataset, indices=[0, 1, 2], threshold=best_thr, device=device)`
+  }
+];
+
 const IMAGE_WEEKS: Week[] = [
   {
     id: 1,
@@ -1928,7 +2588,8 @@ export const TRACKS: Track[] = [
     id: 'segmentation',
     title: 'Segmentation / Masks',
     description: 'Pixel-Perfect: U-Net, RLE, and 3D Volumes',
-    weeks: SEGMENTATION_WEEKS
+    weeks: SEGMENTATION_WEEKS,
+    snippets: SEGMENTATION_SNIPPETS
   },
   {
     id: 'audio',
